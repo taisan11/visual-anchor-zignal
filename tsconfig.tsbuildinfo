@@ -1,0 +1,1 @@
+{"version":"7.0.2","root":["./src/anchor.ts","./src/main.ts","./src/orb-pattern.ts","./src/orientation.ts","./src/vision.ts"],"packageJsons":["./package.json"]}
