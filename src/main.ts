@@ -7,7 +7,16 @@ import {
   type RegistrationCandidate,
   type VisualAnchor,
   verifyBurst,
+  type VerificationResult,
 } from "./anchor";
+import {
+  anchorBinaryFromBase64,
+  anchorBinaryToBase64,
+  BINARY_EXTENSION,
+  BINARY_MIME,
+  decodeAnchorBinary,
+  encodeAnchorBinary,
+} from "./binary";
 import {
   orientationAngleDeg,
   RegistrationOrientationSensor,
@@ -21,7 +30,9 @@ const REGISTER_VIEWS = 5;
 const REGISTER_INTERVAL_MS = 240;
 const REGISTER_OUTPUT_FEATURES = 520;
 const VERIFY_FRAMES = 3;
-const STORAGE_KEY = "visual-anchor-zignal-anchor-v2";
+const SCALE_ASSIST_FACTOR = 1.2;
+const SCALE_ASSIST_MIN_SCORE = 0.12;
+const STORAGE_KEY = "visual-anchor-zignal-anchor-binary-v1";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("#app not found");
@@ -53,10 +64,10 @@ app.innerHTML = `
       <button id="cameraBtn">カメラ開始</button>
       <button id="registerBtn" disabled>地点を登録</button>
       <button id="verifyBtn" disabled>この地点を照合</button>
-      <button id="exportBtn" disabled>Anchor JSONを保存</button>
+      <button id="exportBtn" disabled>Anchor Binaryを保存</button>
       <label class="file-button">
-        Anchor JSONを読み込む
-        <input id="importInput" type="file" accept="application/json,.json" />
+        Anchor Binaryを読み込む
+        <input id="importInput" type="file" accept="${BINARY_MIME},application/octet-stream,${BINARY_EXTENSION}" />
       </label>
     </section>
 
@@ -74,8 +85,9 @@ app.innerHTML = `
     <section class="panel notes">
       <h2>方式</h2>
       <p>登録時だけDeviceOrientationを使い、多めに撮った候補から「端末を回しただけ」のviewを避け、横移動による視差と幾何整合性が取りやすい5 viewを選びます。姿勢値そのものは照合入力に使いません。</p>
-      <p>各viewをRGBA→grayscale→histogram equalization→ORBに変換。V2 Anchorは照合に不要なsize/angle/response/octaveを保存せず、座標を2×uint16へ量子化します。</p>
-      <p>照合は従来どおり画像だけで、JavaScriptのHamming + Lowe ratio/cross-check → Homography RANSACを実行します。</p>
+      <p>各viewをRGBA→grayscale→histogram equalization→ORBに変換し、保存時は座標とdescriptorを固定長のバイナリへ直接格納します。JSON/Base64はファイル形式には使いません。</p>
+      <p>通常の照合で失敗し、ある程度の類似が残っている場合だけ、1 ORB octave相当の1.2× / 0.83×再サンプリングで前後移動による画角差を補助します。判定閾値自体は緩めません。</p>
+      <p>照合は画像だけで、JavaScriptのHamming + Lowe ratio/cross-check → Homography/Fundamental RANSACを実行します。</p>
       <p class="warning">「平面表示の写真」検出は短いburstの視差を使うヒューリスティックで、セキュリティ上の完全なliveness証明ではありません。</p>
     </section>
   </section>
@@ -116,7 +128,7 @@ function updateAnchorInfo(): void {
     exportBtn.disabled = true;
     return;
   }
-  const raw = JSON.stringify(anchor);
+  const binarySize = encodeAnchorBinary(anchor).byteLength;
   const features = anchor.views.reduce((sum, v) => sum + v.count, 0);
   const registration = anchor.registration;
   const sensorLabel = registration.orientationAssisted ? "used for registration" : "not used / fallback";
@@ -125,10 +137,10 @@ function updateAnchorInfo(): void {
     : `${anchor.views.length}`;
 
   anchorInfo.innerHTML = `
-    <div><span>format</span><strong>v${anchor.version}</strong></div>
+    <div><span>format</span><strong>binary v1</strong></div>
     <div><span>candidate → views</span><strong>${candidateLabel}</strong></div>
     <div><span>features</span><strong>${features}</strong></div>
-    <div><span>JSON size</span><strong>${bytes(new Blob([raw]).size)}</strong></div>
+    <div><span>binary size</span><strong>${bytes(binarySize)}</strong></div>
     <div><span>registration sensor</span><strong>${sensorLabel}</strong></div>
     <div><span>orientation span</span><strong>${fmt(registration.orientationSpanDeg ?? 0, 1)}°</strong></div>
     <div><span>registration geometry</span><strong>${fmt(registration.medianPairScore * 100, 0)}%</strong></div>
@@ -138,30 +150,21 @@ function updateAnchorInfo(): void {
   exportBtn.disabled = false;
 }
 
-function validateAnchor(value: unknown): asserts value is VisualAnchor {
-  if (!value || typeof value !== "object") throw new Error("invalid anchor");
-  const v = value as Partial<VisualAnchor>;
-  if (
-    v.format !== "visual-anchor-zignal" ||
-    v.version !== 2 ||
-    !Array.isArray(v.views) ||
-    !v.registration
-  ) {
-    throw new Error("unsupported anchor format");
-  }
-}
-
 function loadSavedAnchor(): void {
-  const text = localStorage.getItem(STORAGE_KEY);
-  if (!text) return;
+  const encoded = localStorage.getItem(STORAGE_KEY);
+  if (!encoded) return;
   try {
-    const parsed: unknown = JSON.parse(text);
-    validateAnchor(parsed);
-    anchor = parsed;
+    anchor = decodeAnchorBinary(anchorBinaryFromBase64(encoded));
     updateAnchorInfo();
   } catch {
     localStorage.removeItem(STORAGE_KEY);
   }
+}
+
+function persistAnchor(value: VisualAnchor): Uint8Array {
+  const binary = encodeAnchorBinary(value);
+  localStorage.setItem(STORAGE_KEY, anchorBinaryToBase64(binary));
+  return binary;
 }
 
 async function startCamera(): Promise<void> {
@@ -193,20 +196,58 @@ function captureFrame(): ImageData {
   return ctx.getImageData(0, 0, width, height);
 }
 
+function resizeImageData(image: ImageData, scale: number): ImageData {
+  if (Math.abs(scale - 1) < 1e-6) return image;
+  const source = document.createElement("canvas");
+  source.width = image.width;
+  source.height = image.height;
+  const sourceContext = source.getContext("2d", { willReadFrequently: true });
+  if (!sourceContext) throw new Error("Canvas 2D is unavailable");
+  sourceContext.putImageData(image, 0, 0);
+
+  const target = document.createElement("canvas");
+  target.width = Math.max(1, Math.round(image.width * scale));
+  target.height = Math.max(1, Math.round(image.height * scale));
+  const targetContext = target.getContext("2d", { willReadFrequently: true });
+  if (!targetContext) throw new Error("Canvas 2D is unavailable");
+  targetContext.imageSmoothingEnabled = true;
+  targetContext.imageSmoothingQuality = "high";
+  targetContext.drawImage(source, 0, 0, target.width, target.height);
+  return targetContext.getImageData(0, 0, target.width, target.height);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function captureFeatures(count: number, intervalMs: number): Promise<FeatureSet[]> {
-  const frames: FeatureSet[] = [];
+async function captureBurstImages(count: number, intervalMs: number): Promise<ImageData[]> {
+  const images: ImageData[] = [];
   for (let i = 0; i < count; i++) {
-    const image = captureFrame();
-    const features = vision.extract(image, { maxFeatures: 700, fastThreshold: 18, equalize: true });
-    if (features.count < 60) throw new Error(`特徴点が少なすぎます (${features.count})。模様のある対象を入れてください。`);
-    frames.push(features);
+    images.push(captureFrame());
     if (i + 1 < count) await sleep(intervalMs);
   }
-  return frames;
+  return images;
+}
+
+function extractBurstAtScale(images: ImageData[], scale: number): FeatureSet[] {
+  return images.map(image => {
+    const scaled = resizeImageData(image, scale);
+    const features = vision.extract(scaled, {
+      maxFeatures: scale === 1 ? 700 : 660,
+      fastThreshold: 18,
+      equalize: true,
+    });
+    if (features.count < 60) {
+      throw new Error(`特徴点が少なすぎます (${features.count})。模様のある対象を入れてください。`);
+    }
+    return features;
+  });
+}
+
+function betterVerification(current: VerificationResult, candidate: VerificationResult): VerificationResult {
+  if (candidate.ok !== current.ok) return candidate.ok ? candidate : current;
+  if (candidate.score !== current.score) return candidate.score > current.score ? candidate : current;
+  return candidate.geometry.inliers > current.geometry.inliers ? candidate : current;
 }
 
 function updateRegistrationGuide(reference?: OrientationSample, current?: OrientationSample): void {
@@ -284,8 +325,7 @@ async function register(): Promise<void> {
       inputFeatureCount,
       outputFeatureCount,
     });
-    const serialized = JSON.stringify(anchor);
-    localStorage.setItem(STORAGE_KEY, serialized);
+    const binary = persistAnchor(anchor);
     updateAnchorInfo();
 
     orientationStatus.textContent = orientationAvailable
@@ -296,7 +336,7 @@ async function register(): Promise<void> {
     result.innerHTML = `
       <strong>登録完了</strong>
       <span>candidate ${candidates.length} → view ${selection.indices.map(i => i + 1).join(" / ")}</span>
-      <span>${inputFeatureCount} → ${outputFeatureCount} features · ${bytes(new Blob([serialized]).size)}</span>
+      <span>${inputFeatureCount} → ${outputFeatureCount} features · ${bytes(binary.byteLength)}</span>
     `;
   } catch (error) {
     result.className = "result fail";
@@ -317,7 +357,7 @@ async function register(): Promise<void> {
 async function verify(): Promise<void> {
   if (!anchor) {
     result.className = "result fail";
-    result.textContent = "先に地点を登録するかAnchor JSONを読み込んでください";
+    result.textContent = "先に地点を登録するかAnchor Binaryを読み込んでください";
     return;
   }
   registerBtn.disabled = true;
@@ -326,9 +366,34 @@ async function verify(): Promise<void> {
   result.textContent = "3 frameを画像だけで照合中… 少し横に動かしてください";
   orientationStatus.textContent = "Orientation: OFF (照合では不使用)";
   try {
-    // Deliberately no DeviceOrientation access here.
-    const query = await captureFeatures(VERIFY_FRAMES, 230);
-    const v = verifyBurst(vision, anchor, query);
+    // Deliberately no DeviceOrientation access here. Scale assist is also image-only.
+    const images = await captureBurstImages(VERIFY_FRAMES, 230);
+    let usedScale = 1;
+    let verification = verifyBurst(vision, anchor, extractBurstAtScale(images, 1));
+
+    if (!verification.ok && verification.score >= SCALE_ASSIST_MIN_SCORE) {
+      result.textContent = "画角差を検出中… 1 octave分だけスケール補助を試しています";
+      const fartherScale = SCALE_ASSIST_FACTOR;
+      const farther = verifyBurst(vision, anchor, extractBurstAtScale(images, fartherScale));
+      const afterFarther = betterVerification(verification, farther);
+      if (afterFarther !== verification) {
+        verification = afterFarther;
+        usedScale = fartherScale;
+      }
+
+      if (!verification.ok) {
+        const nearerScale = 1 / SCALE_ASSIST_FACTOR;
+        const nearer = verifyBurst(vision, anchor, extractBurstAtScale(images, nearerScale));
+        const afterNearer = betterVerification(verification, nearer);
+        if (afterNearer !== verification) {
+          verification = afterNearer;
+          usedScale = nearerScale;
+        }
+      }
+    }
+
+    const v = verification;
+    const scaleLabel = Math.abs(usedScale - 1) < 1e-6 ? "off" : `${fmt(usedScale, 2)}×`;
     result.className = `result ${v.ok ? "pass" : "fail"}`;
     result.innerHTML = `
       <div class="verdict">${v.ok ? "MATCH" : "NO MATCH"}</div>
@@ -338,8 +403,9 @@ async function verify(): Promise<void> {
         <span>matches <b>${v.geometry.matches}</b></span>
         <span>RANSAC inliers <b>${v.geometry.inliers}</b></span>
         <span>inlier ratio <b>${fmt(v.geometry.inlierRatio * 100, 0)}%</b></span>
-        <span>mean reproj <b>${fmt(v.geometry.meanError)} px</b></span>
+        <span>mean geometry error <b>${fmt(v.geometry.meanError)} px</b></span>
         <span>ORB distance <b>${fmt(v.geometry.avgDistance, 1)}</b></span>
+        <span>scale assist <b>${scaleLabel}</b></span>
       </div>
       <div class="risk ${v.planarReplayRisk ? "hot" : ""}">
         planar replay heuristic: <b>${v.planarReplayRisk ? "suspicious" : "not detected"}</b>
@@ -366,11 +432,13 @@ verifyBtn.addEventListener("click", () => void verify());
 
 exportBtn.addEventListener("click", () => {
   if (!anchor) return;
-  const blob = new Blob([JSON.stringify(anchor)], { type: "application/json" });
+  const binary = encodeAnchorBinary(anchor);
+  const arrayBuffer = binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength) as ArrayBuffer;
+  const blob = new Blob([arrayBuffer], { type: BINARY_MIME });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `visual-anchor-${Date.now()}.json`;
+  a.download = `visual-anchor-${Date.now()}${BINARY_EXTENSION}`;
   a.click();
   URL.revokeObjectURL(url);
 });
@@ -379,13 +447,11 @@ importInput.addEventListener("change", async () => {
   const file = importInput.files?.[0];
   if (!file) return;
   try {
-    const parsed: unknown = JSON.parse(await file.text());
-    validateAnchor(parsed);
-    anchor = parsed;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(anchor));
+    anchor = decodeAnchorBinary(await file.arrayBuffer());
+    persistAnchor(anchor);
     updateAnchorInfo();
     result.className = "result pass";
-    result.textContent = `Anchor JSON v${anchor.version}を読み込みました`;
+    result.textContent = "Anchor Binaryを読み込みました";
   } catch (error) {
     result.className = "result fail";
     result.textContent = error instanceof Error ? error.message : String(error);
