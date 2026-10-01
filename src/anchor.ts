@@ -141,7 +141,8 @@ export function homographyTranslation(g: MatchGeometry): number {
 
 function parallaxSignature(g: MatchGeometry): number {
   const motion = Math.max(1, homographyTranslation(g));
-  return g.p90Error > 0 ? g.p90Error / motion : 0;
+  const p90 = g.homographyP90Error ?? g.p90Error;
+  return p90 > 0 ? p90 / motion : 0;
 }
 
 /**
@@ -346,14 +347,17 @@ export function verifyBurst(
     const translation = homographyTranslation(temporalGeometry);
     const currentParallax = parallaxSignature(temporalGeometry);
     const registeredParallax = anchor.registration.medianParallaxSignature ?? 0;
+    const homographyInliers = temporalGeometry.homographyInliers ?? temporalGeometry.inliers;
+    const homographyInlierRatio = temporalGeometry.homographyInlierRatio ?? temporalGeometry.inlierRatio;
+    const homographyP90Error = temporalGeometry.homographyP90Error ?? temporalGeometry.p90Error;
     // Heuristic only: compare live burst non-planarity against the scene's registration baseline.
     planarReplayRisk =
       registeredParallax >= 0.015 &&
-      temporalGeometry.inliers >= 28 &&
-      temporalGeometry.inlierRatio >= 0.75 &&
+      homographyInliers >= 28 &&
+      homographyInlierRatio >= 0.75 &&
       translation >= 5 &&
-      temporalGeometry.p90Error > 0 &&
-      temporalGeometry.p90Error < 1.0 &&
+      homographyP90Error > 0 &&
+      homographyP90Error < 1.0 &&
       currentParallax < registeredParallax * 0.35;
   }
 
