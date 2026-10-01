@@ -15,9 +15,27 @@ getUserMedia
   -> multi-scale FAST + oriented BRIEF (JavaScript)
   -> Hamming matcher
   -> Lowe ratio + mutual cross-check
-  -> Homography RANSAC
+  -> Homography / Fundamental RANSAC
   -> multi-view score                (TypeScript)
+  -> 必要時のみ ±1 octave scale assist
 ```
+
+## 前後移動・画角差へのscale assist
+
+通常の照合はこれまでどおり640px前後の画像をそのままORBへ入れます。
+
+登録位置より少し後ろへ下がると対象が小さくなり、ORBのdescriptor patchが登録時と違うスケールを見て照合数が落ちることがあります。逆に少し近づいた場合は対象が大きくなります。
+
+そこで通常照合に失敗した場合だけ、元のburst画像をORBの標準的なscale factorと同じ1.2倍、またはその逆数の約0.83倍へ再サンプリングして再照合します。
+
+```text
+normal 1.00x
+  -> fail but some similarity remains
+  -> 1.20x retry
+  -> still failなら 0.83x retry
+```
+
+通常成功時には追加処理をしないため、従来の照合速度を維持します。またHamming距離やratio/cross-check、RANSAC、最終判定閾値そのものは緩めていません。
 
 ## 登録時のDeviceOrientation補助
 
@@ -38,32 +56,27 @@ getUserMedia
 
 一部ブラウザでは `DeviceOrientationEvent.requestPermission()` が必要です。登録ボタンのユーザー操作から直接要求します。絶対方位は不要なので、対応実装では `requestPermission(false)` を使い、磁気センサーを要求しません。
 
-## Anchor V2の出力最適化
+## Binary Anchor形式
 
-登録時のORB計算には通常どおり完全なkeypoint情報を使いますが、照合に必要なのは実際には
+エクスポート形式をJSONから`.vaz`バイナリへ変更しています。旧JSON形式との互換コードは持ちません。
 
-- keypoint `x, y`
-- 32-byte ORB descriptor
+登録時のORB計算には完全なkeypoint情報を使いますが、保存するviewごとには照合に必要な
 
-だけです。
+- `x, y`: 2 × uint16 = 4 bytes/feature
+- ORB descriptor: 32 bytes/feature
 
-V2 Anchorでは、従来の
+を直接バイナリへ格納します。JSONのキー文字列やBase64による約4/3倍の膨張をファイル上から除去します。
 
-```text
-x, y, size, angle, response, octave = 6 × float32 = 24 bytes/feature
-```
+ファイルにはさらに以下だけを小さな固定長/可変長フィールドとして格納します。
 
-を保存せず、
+- 作成時刻・processing width
+- registration score / parallax statistics
+- 選択candidate index
+- view width / height / count
 
-```text
-x, y = 2 × uint16 = 4 bytes/feature
-```
+末尾にはCRC32を付与し、読み込み時に破損を検出します。ブラウザの`localStorage`は文字列APIなので、自動保存時だけ同じバイナリをBase64へ包みます。エクスポートファイルそのものはJSON/Base64ではありません。
 
-へ量子化します。読み込み時にJavaScriptのkeypoint配列へ展開します。座標の丸め誤差は最大約0.5pxで、標準のRANSAC閾値4pxより十分小さい範囲です。
-
-また、選択したviewごとに特徴点を空間グリッドで均等化し、強い特徴だけ最大520点へpruneします。画面の一部だけに特徴点が集中するのを避けつつJSONサイズを下げます。
-
-旧形式の互換コードは持たず、Anchor version 2形式だけを読み書きします。
+また、選択したviewごとに特徴点を空間グリッドで均等化し、強い特徴だけ最大520点へpruneします。画面の一部だけに特徴点が集中するのを避けながら保存量と照合量を抑えます。
 
 ## 重要: 照合時は姿勢センサー非依存
 
@@ -74,17 +87,17 @@ camera frame
   -> JavaScript ORB
   -> stored ORB descriptors
   -> JavaScript Hamming matching
-  -> JavaScript Homography RANSAC
+  -> JavaScript Homography / Fundamental RANSAC
   -> multi-frame image geometry
 ```
 
-`verify()` / `verifyBurst()` はDeviceOrientationを開始・参照しません。そのため、登録した端末と照合端末のセンサー差、磁気環境、ブラウザの姿勢API対応状況は照合結果に影響しません。
+`verify()` / `verifyBurst()` はDeviceOrientationを開始・参照しません。そのため、登録した端末と照合端末のセンサー差、磁気環境、ブラウザの姿勢API対応状況は照合結果に影響しません。scale assistも画像の再サンプリングだけで行います。
 
 ## ブラウザAPIと互換性
 
-Canvas 2D (`drawImage`, `getImageData`) がカメラ画像の縮小と画素取得を行い、`ImageData` / TypedArrayでピクセルと特徴量を処理します。画像ピラミッドは `OffscreenCanvas` があれば利用し、なければ通常のCanvasへフォールバックします。MDN Browser Compatibility DataによるとOffscreenCanvasはiOS Safari 16.4以降で利用可能です。
+Canvas 2D (`drawImage`, `getImageData`) がカメラ画像の縮小と画素取得を行い、`ImageData` / TypedArrayでピクセルと特徴量を処理します。画像ピラミッドは `OffscreenCanvas` があれば利用し、なければ通常のCanvasへフォールバックします。
 
-WebGPUはiOS Safari 26以降でサポートされていますが、このアプリは小さな画像バッファを段階的に処理するため、GPUへの転送とreadbackを挟むよりCanvasの最適化とJavaScript TypedArray処理を使う構成にしています。WebGPUがなくても動作します。
+WebGPUは必須ではありません。このアプリは小さな画像バッファを段階的に処理するため、GPUへの転送とreadbackを挟まずCanvasとJavaScript TypedArrayで完結させています。
 
 - [MDN: OffscreenCanvas](https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas)
 - [MDN: CanvasRenderingContext2D.getImageData()](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/getImageData)
@@ -113,10 +126,11 @@ JavaScriptのmatcherは以下を返します。
 matches
 inliers
 inlier ratio
-mean reprojection error
-p90 reprojection error
+mean geometric error
+p90 homography reprojection error
 average Hamming distance
 3x3 homography
+fundamental matrix diagnostics
 ```
 
 UI側ではこれを0〜1のgeometry scoreにまとめ、3-frame burstの中央値で地点判定します。
@@ -144,6 +158,7 @@ src/vision.ts          JavaScript ORB + matching / RANSAC
 src/orb-pattern.ts     ORB learned sampling pattern
 src/orientation.ts     registration-only DeviceOrientation helper
 src/anchor.ts          view selection / compression / scoring
-src/main.ts            camera + UI
+src/binary.ts          .vaz binary codec + CRC32
+src/main.ts            camera + scale assist + UI
 src/styles.css
 ```
