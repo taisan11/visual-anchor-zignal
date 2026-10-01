@@ -43,6 +43,12 @@ const CIRCLE: readonly (readonly [number, number])[] = [
   [0,-3],[1,-3],[2,-2],[3,-1],[3,0],[3,1],[2,2],[1,3],
   [0,3],[-1,3],[-2,2],[-3,1],[-3,0],[-3,-1],[-2,-2],[-1,-3],
 ];
+// A rotated BRIEF sample can extend beyond the nominal 31x31 patch. Include
+// 0.5 px for Math.round so every sampled coordinate is guaranteed in-bounds.
+const ORB_BORDER = Math.ceil(ORB_PATTERN.reduce(
+  (radius, [x1, y1, x2, y2]) => Math.max(radius, Math.hypot(x1, y1), Math.hypot(x2, y2)),
+  15,
+) + 0.5);
 
 type Mat3 = [number, number, number, number, number, number, number, number, number];
 
@@ -121,7 +127,7 @@ type Corner = { x: number; y: number; response: number; angle: number; octave: n
 
 function extractLevel(level: Level, octave: number, threshold: number, maxCount: number): Corner[] {
   const { width: w, height: h, pixels: im } = level;
-  if (w < 32 || h < 32) return [];
+  if (w <= ORB_BORDER * 2 || h <= ORB_BORDER * 2) return [];
   const raw: Corner[] = [];
   const at = (x: number, y: number) => im[y * w + x];
   for (let y = 3; y < h - 3; y++) for (let x = 3; x < w - 3; x++) {
@@ -148,8 +154,8 @@ function extractLevel(level: Level, octave: number, threshold: number, maxCount:
   const responseMap = new Int32Array(w * h);
   for (const p of raw) responseMap[p.y * w + p.x] = p.response;
   const points = raw.filter(p => {
-    // ORB's 31x31 orientation/BRIEF patch must be fully inside this pyramid level.
-    if (p.x < 16 || p.y < 16 || p.x >= w - 16 || p.y >= h - 16) return false;
+    // Keep the full orientation patch and every rotated BRIEF sample inside this level.
+    if (p.x < ORB_BORDER || p.y < ORB_BORDER || p.x >= w - ORB_BORDER || p.y >= h - ORB_BORDER) return false;
     for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
       if ((dx || dy) && responseMap[(p.y + dy) * w + p.x + dx] > p.response) return false;
     }
@@ -594,8 +600,7 @@ export class VisualAnchorJS {
     const fInliers = fFit?.inliers ?? 0;
     const useFundamental = fInliers > hInliers + Math.max(3, Math.round(pairs.length * 0.04));
     const inliers = useFundamental ? fInliers : hInliers;
-    // Preserve homography reprojection error for existing scoring/UI; fall back to Sampson distance only if H fails.
-    const meanError = hFit?.mean ?? Math.sqrt(fFit?.mean ?? 0);
+    const meanError = useFundamental ? Math.sqrt(fFit?.mean ?? 0) : (hFit?.mean ?? 0);
     // Keep p90Error homography-specific because registration/replay code uses it as a non-planarity signal.
     const p90Error = hFit?.p90 ?? 0;
 
